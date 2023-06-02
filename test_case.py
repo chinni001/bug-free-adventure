@@ -1,45 +1,73 @@
-import boto3
 import pytest
+from sqs_lambda import parse_sqs_message
 
-# Set up SQS clients
-sqs_source = boto3.client('sqs')
-sqs_destination = boto3.client('sqs')
 
-# Set up test queue URLs
-source_queue_url = 'your-source-queue-url'
-destination_queue_url = 'your-destination-queue-url'
+def test_parse_sqs_message_no_records():
 
-def test_single_message_transfer():
-    # Send a single message to the source queue
-    message_body = 'Test message'
-    sqs_source.send_message(QueueUrl=source_queue_url, MessageBody=message_body)
+    sqs_data = {"Records": []}
+    msg_parsed = parse_sqs_message(sqs_data)
 
-    # Invoke the function to read and transfer the message
-    read_messages_from_queue(source_queue_url, destination_queue_url)
+    assert msg_parsed == [[], None]
 
-    # Retrieve the messages from the destination queue
-    response = sqs_destination.receive_message(QueueUrl=destination_queue_url, MaxNumberOfMessages=1)
 
-    # Verify that the message is received correctly in the destination queue
-    assert 'Messages' in response
-    assert response['Messages'][0]['Body'] == message_body
+@pytest.mark.parametrize("sqs_data, key", [
+    ({"Records": [{"receiptHandle": ""}]}, 'body'),
+    ({"Records": [{"body": ""}]}, 'Message')
+])
+def test_parse_sqs_message_key_missing_body(sqs_data, key):
 
-def test_multiple_message_transfer():
-    # Send multiple messages to the source queue
-    messages = ['Message 1', 'Message 2', 'Message 3']
-    for message in messages:
-        sqs_source.send_message(QueueUrl=source_queue_url, MessageBody=message)
+    with pytest.raises(Exception) as exc_info:
+        msg_parsed = parse_sqs_message(sqs_data)
+        raise KeyError(f"Key '{key}' is missing")
 
-    # Invoke the function to read and transfer the messages
-    read_messages_from_queue(source_queue_url, destination_queue_url)
+    assert exc_info.value.args[0] == f"Key '{key}' is missing"
 
-    # Retrieve the messages from the destination queue
-    response = sqs_destination.receive_message(QueueUrl=destination_queue_url, MaxNumberOfMessages=len(messages))
 
-    # Verify that all messages are received correctly in the destination queue
-    assert 'Messages' in response
-    received_messages = [msg['Body'] for msg in response['Messages']]
-    assert received_messages == messages
+@pytest.mark.parametrize("sqs_data, receipt_handle", [
+    ({
+        "Records": [{
+            "body": '{"Message": "{}"}',
+            "receiptHandle": "receiptHandle_string"
+            }]
+    }, "receiptHandle_string"),
+    ({
+        "Records": [
+            {
+                "body": '{"Message": "{}"}',
+                "receiptHandle": "receiptHandle_string"
+            },
+            {
+                "body": '{"Message": "{}"}',
+                "receiptHandle": "receiptHandle_string_another"
+            },            
+        ]
+    }, "receiptHandle_string"),    
+])
+def test_parse_sqs_message_receipt_handle(sqs_data, receipt_handle):
 
-# Run the tests
-pytest.main()
+    msg_parsed = parse_sqs_message(sqs_data)
+    assert msg_parsed == [[], receipt_handle]
+
+@pytest.mark.parametrize("sqs_data", [
+    {"Records": [{"body": '{"Message": "{}"}'}]},
+    {"Records": [{"body": '{"Message": "{\'custom\': \'\'}"}'}]},
+])
+def test_parse_sqs_message_custom_key_missing(sqs_data):
+
+    msg_parsed = parse_sqs_message(sqs_data)
+    assert msg_parsed[0] == []
+    
+
+def test_parse_sqs_message_ecspassthru_data():
+
+    sqs_data = {
+        "Records": [
+            {
+                'body': '{"Message": "{\\"custom\\": \\"{\\\\\\"ECSPassThru\\\\\\": \\\\\\"ecspassthru_value\\\\\\"}\\"}"}',
+                'receiptHandle': 'receiptHandle_string'
+            }
+        ]
+    }
+
+    msg_parsed = parse_sqs_message(sqs_data)
+    assert msg_parsed == [["ecspassthru_value"], "receiptHandle_string"]
