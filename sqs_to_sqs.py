@@ -1,41 +1,76 @@
+import os
+import json
+import time
 import boto3
+import logging
+import datetime
+from botocore.exceptions import ClientError
+# from log_util import LogRequestHeader, MessageLogMap
 
-def lambda_handler(event, context):
-    # Create SQS clients
-    sqs_source = boto3.client('sqs')
-    sqs_destination = boto3.client('sqs')
+log_format = "%(message)s"
+logging.basicConfig(format=log_format)
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
-    # Define the source and destination SQS queue URLs
-    source_queue_url = 'your-source-queue-url'
-    destination_queue_url = 'your-destination-queue-url'
+timestamp = datetime.datetime.fromtimestamp(time.time()).strftime('%Y-%m-%d %H:%M:%S')
 
-    # Receive messages from the source SQS queue
-    response = sqs_source.receive_message(
-        QueueUrl=source_queue_url,
-        MaxNumberOfMessages=10,  # Maximum number of messages to receive (adjust as needed)
-        AttributeNames=['All'],
-        MessageAttributeNames=['All'],
-        WaitTimeSeconds=20  # Wait up to 20 seconds for messages (adjust as needed)
-    )
+sqs = boto3.client('sqs')
+dynamodb = boto3.resource('dynamodb')
 
-    # Process received messages
-    if 'Messages' in response:
-        for message in response['Messages']:
-            # Extract message attributes and body
-            message_attributes = message['MessageAttributes']
-            message_body = message['Body']
+queue_url = os.environ.get('DOC_MQ_SQS_URL')
+fire_table_name = os.environ.get('FIRE_EMAIL_DYNAMO_NAME')
 
-            # Send the message to the destination SQS queue
-            sqs_destination.send_message(
-                QueueUrl=destination_queue_url,
-                MessageBody=message_body,
-                MessageAttributes=message_attributes
-            )
 
-            # Delete processed message from the source SQS queue
-            sqs_source.delete_message(
-                QueueUrl=source_queue_url,
-                ReceiptHandle=message['ReceiptHandle']
-            )
-    else:
-        print('No messages in the source queue.')
+def parse_sqs_message(sqs_records):
+
+    rec_dict = {}
+
+    try:
+        record = sqs_records[0]
+
+        body = json.loads(record['body'])
+        message = json.loads(body['Message'])
+
+        if 'custom' in message:
+            custom = json.loads(message['custom'])
+            if 'ECSPassThru' in custom:
+                rec_dict["ecspass_thru"] = custom['ECSPassThru']
+
+        rec_dict["receipt_handle"] = record["receiptHandle"]
+
+        return rec_dict
+
+    except (json.decoder.JSONDecodeError, Exception) as error:
+        logger.exception(f"Failed to parse the message {error}")
+
+
+def lambda_handler(event, _context):
+
+    # request_id = _context.aws_request_id
+    # MessageLogMap.VISCOG001.write_log(LogRequestHeader('', request_id), {})
+    # re-invoke sqs in case of lambda failure
+    
+    sqs_msg_dict = parse_sqs_message(event['Records'])
+
+    if not sqs_msg_dict.get("ecspass_thru"):
+        return {
+            "message": "SQS Messages not found"
+        }
+
+    try:
+        response = sqs.send_message(QueueUrl=queue_url, MessageBody=json.dumps(sqs_msg_dict["ecspass_thru"]))
+        dlt_response = sqs.delete_message(
+            QueueUrl="https://sqs.us-east-1.amazonaws.com/976416294762/visioncog-sandbox-doc-mgmt-manifest-iseit",
+            ReceiptHandle=sqs_msg_dict["receipt_handle"]
+        )
+        logger.info(f"sent to sqs successfully \'{sqs_msg_dict['ecspass_thru']}\'")
+
+        return {
+            "status": 200,
+            "message": "SQS Message processed successfully"
+        }
+
+    except (ClientError, Exception) as error:
+        logger.error(f"failed to process the sqs message '{error}'")
+
+        return "Failed"
